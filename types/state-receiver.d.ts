@@ -100,6 +100,7 @@ declare class StateReceiver {
     pingIntervalMs: number;
     drainTimeoutMs: number;
     _inflightDelivery: Promise<void>;
+    _draining: boolean;
     _requestedEpoch: number;
     _silenceTimer: NodeJS.Timer;
     _pingTimer: NodeJS.Timer;
@@ -180,6 +181,7 @@ declare class StateReceiver {
         serializedMessageQueueSize: number;
     };
     deliverDeserializedBlock(blockData: any): Promise<void>;
+    _warn(...args: any[]): void;
     _onError(e: any): void;
 }
 declare namespace StateReceiver {

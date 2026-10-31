@@ -121,6 +121,7 @@ class StateReceiver {
     // the new socket for blocks. 0 = do not wait (4.0.5 behaviour).
     this.drainTimeoutMs = Number(config.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
     this._inflightDelivery = null;
+    this._draining = false;
     // The epoch whose connection last sent get_blocks_request. A delivery that a reconnect superseded
     // may still advance the cursor until the new connection has requested blocks (that is exactly
     // what the drain waits for), and must not touch it after.
@@ -194,7 +195,7 @@ class StateReceiver {
      */
     this._connectionEpoch += 1;
     if (this.processingMessageData) {
-      this.logger.warn(
+      this._warn(
         `Restarting while a message batch was in flight (epoch ${this._connectionEpoch}); ` +
           `abandoning it. Its connection is gone and its results are no longer valid.`
       );
@@ -287,8 +288,10 @@ class StateReceiver {
   _checkSilence(connection) {
     if (this.connection !== connection) return;
     const now = Date.now();
-    if (this.processingMessageData || this.serializedMessageQueue.length > 0) {
-      // We are the bottleneck, not the server.
+    if (this.processingMessageData || this.serializedMessageQueue.length > 0 || this._draining) {
+      // We are the bottleneck, not the server. A drain (4.0.6) is bounded by drainTimeoutMs on its
+      // own, so it must not also be killed as silence -- that would reconnect forever without ever
+      // requesting blocks when silenceTimeoutMs < drainTimeoutMs.
       this._lastActivityAt = now;
       return;
     }
@@ -356,6 +359,9 @@ class StateReceiver {
 
   stop() {
     this.logger.info(`==== Receive stop command: stopping receiver.`);
+    // 4.0.6: a stop supersedes any in-flight batch or drain, exactly like a reconnect.
+    this._connectionEpoch += 1;
+    this._draining = false;
     this._clearWatchdog();
     if (this.connection) {
       this.connection.disconnect();
@@ -423,6 +429,7 @@ class StateReceiver {
     const inflight = this._inflightDelivery;
     if (inflight && this.drainTimeoutMs > 0) {
       const started = Date.now();
+      this._draining = true;
       let timer;
       const timedOut = await Promise.race([
         inflight.then(
@@ -435,12 +442,22 @@ class StateReceiver {
         }),
       ]);
       clearTimeout(timer);
-      if (timedOut) {
-        this.logger.error(
-          `[statereceiver] block delivery still running after ${this.drainTimeoutMs} ms; requesting ` +
-            `blocks anyway from ${this.current_block + 1} (that block may be delivered again).`
-        );
-      } else {
+      if (this._connectionEpoch === epoch) this._draining = false;
+      if (timedOut && this._connectionEpoch === epoch) {
+        const message =
+          `[statereceiver] block delivery still running after ${this.drainTimeoutMs} ms ` +
+          `(cursor ${this.current_block}).`;
+        if (typeof this.config.onError === 'function') {
+          // The consumer owns recovery. Requesting now would deliver blocks while the stuck handler
+          // still runs (overlap); the bridge consumers exit the process here and resume from their
+          // persisted cursor, which also ends the stuck handler.
+          this._onError(new Error(`${message} Not requesting blocks; reporting to onError.`));
+          return;
+        }
+        // No onError: never latch. Request again from the block after the cursor (that block may be
+        // delivered again while the stuck delivery is still running).
+        this.logger.error(`${message} Requesting blocks anyway from ${this.current_block + 1}.`);
+      } else if (!timedOut) {
         this.logger.info(
           `[statereceiver] waited ${
             Date.now() - started
@@ -526,7 +543,7 @@ class StateReceiver {
     if (this.connection && this.connection.ws && this.connection.connected == true) {
       this.connection.ws.send(serialize(this.types, 'request', request));
     } else {
-      this.logger.warn('Connection is not ready, cannot send message.');
+      this._warn('Connection is not ready, cannot send message.');
     }
   }
 
@@ -610,7 +627,7 @@ class StateReceiver {
           );
         }
         if (superseded()) {
-          this.logger.warn(
+          this._warn(
             `Abandoning message batch: superseded by a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}).`
           );
           return;
@@ -633,7 +650,7 @@ class StateReceiver {
         });
 
         if (superseded()) {
-          this.logger.warn(
+          this._warn(
             `Abandoning message batch: superseded by a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}).`
           );
           return;
@@ -648,7 +665,7 @@ class StateReceiver {
             if (this._inflightDelivery === delivery) this._inflightDelivery = null;
           }
           if (superseded()) {
-            this.logger.warn(
+            this._warn(
               `Delivery finished after a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}); ` +
                 `not acknowledging it on the new connection.`
             );
@@ -707,7 +724,7 @@ class StateReceiver {
   async deliverDeserializedBlock(blockData) {
     const myEpoch = this._connectionEpoch;
     if (!blockData || !blockData.this_block) {
-      this.logger.warn(`Block data is not valid.`, blockData);
+      this._warn(`Block data is not valid.`, blockData);
       return;
     }
 
@@ -735,12 +752,18 @@ class StateReceiver {
     // this block. Once the new connection HAS requested blocks it owns the cursor, and a late write
     // could move it backward and make the next reconnect replay blocks.
     if (this._connectionEpoch !== myEpoch && this._requestedEpoch === this._connectionEpoch) {
-      this.logger.warn(
+      this._warn(
         `Block ${block_num} finished after a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}); cursor left at ${this.current_block}.`
       );
       return;
     }
     this.current_block = Math.max(this.current_block, block_num);
+  }
+
+  // 4.0.6: consumers only guarantee info/error; never throw for a missing warn.
+  _warn(...args) {
+    if (typeof this.logger.warn === 'function') this.logger.warn(...args);
+    else this.logger.info(...args);
   }
 
   _onError(e) {

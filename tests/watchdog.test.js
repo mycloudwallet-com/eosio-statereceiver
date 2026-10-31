@@ -257,6 +257,117 @@ describe('statereceiver liveness watchdog (silent stream + missing pong)', () =>
     expect(receiver.current_block).toBe(before); // the late finish does not move the cursor
   });
 
+  function hungDeliveryServer() {
+    return startServer((ws, index) => {
+      if (index === 0) {
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) sendBlocks(ws, 1);
+        }, 30);
+        setTimeout(() => ws.terminate(), 150);
+      }
+    });
+  }
+
+  it('(e) 4.0.6 drain timeout with onError: reported, and no blocks are requested (no overlap)', async () => {
+    const errors = [];
+    server = await hungDeliveryServer();
+    makeReceiver({
+      silenceTimeoutMs: 60000,
+      pingIntervalMs: 60000,
+      drainTimeoutMs: 300,
+      onError: (e) => errors.push(String(e && e.message)),
+    });
+    receiver.registerTraceHandler({ processTrace: () => new Promise(() => {}) });
+    receiver.start();
+    await waitFor(
+      () => errors.some((m) => m.includes('still running after 300 ms')),
+      3000,
+      'onError'
+    );
+    await sleep(200);
+    expect(server.connectionsSeen.length).toBe(2);
+    expect(getBlocksRequests(server.connectionsSeen[1])).toHaveLength(0);
+  });
+
+  it('(f) 4.0.6 a drain is not silence: silence < drain does not loop, blocks are requested after it', async () => {
+    let release;
+    server = await hungDeliveryServer();
+    makeReceiver({ silenceTimeoutMs: 200, pingIntervalMs: 60000, drainTimeoutMs: 5000 });
+    receiver.registerTraceHandler({
+      processTrace: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    await sleep(700); // > 3 x silenceTimeoutMs while draining
+    expect(server.connectionsSeen.length).toBe(2);
+    release();
+    await waitFor(
+      () => getBlocksRequests(server.connectionsSeen[1]).length >= 1,
+      2000,
+      'get_blocks_request after the drain'
+    );
+    expect(getBlocksRequests(server.connectionsSeen[1])[0][1].start_block_num).toBe(
+      START_BLOCK + 1
+    );
+  });
+
+  it('(g) 4.0.6 a logger without warn never breaks a reconnect mid-block', async () => {
+    let release;
+    server = await hungDeliveryServer();
+    const port = server.address().port;
+    const logger = { info: jest.fn(), debug: jest.fn(), error: jest.fn() }; // no warn
+    receiver = new StateReceiver({
+      logger,
+      startBlock: START_BLOCK,
+      socketAddresses: [`ws://127.0.0.1:${port}`],
+      eosApi: {},
+      maxQueueSize: 10,
+      fetchBlockTime: false,
+      silenceTimeoutMs: 60000,
+      pingIntervalMs: 60000,
+      drainTimeoutMs: 5000,
+    });
+    receiver.registerTraceHandler({
+      processTrace: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    release();
+    await waitFor(
+      () => getBlocksRequests(server.connectionsSeen[1]).length >= 1,
+      2000,
+      'get_blocks_request after the drain'
+    );
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join('\n')).not.toMatch(
+      /warn is not a function/
+    );
+  });
+
+  it('(h) 4.0.6 stop() during a drain: nothing is requested and nothing reconnects', async () => {
+    let release;
+    server = await hungDeliveryServer();
+    makeReceiver({ silenceTimeoutMs: 60000, pingIntervalMs: 60000, drainTimeoutMs: 5000 });
+    receiver.registerTraceHandler({
+      processTrace: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    receiver.stop();
+    release();
+    await sleep(300);
+    expect(getBlocksRequests(server.connectionsSeen[1])).toHaveLength(0);
+    expect(server.connectionsSeen.length).toBe(2);
+  });
+
   it('(a-control) a stream that keeps delivering is never torn down', async () => {
     server = await startServer((ws) => {
       const t = setInterval(() => {

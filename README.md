@@ -83,9 +83,11 @@ duration and the last block.
 
 **Reconnect and in-flight blocks (4.0.6).** A reconnect never overlaps a block whose trace handlers
 are still running: the new connection waits up to `drainTimeoutMs` for that delivery, then requests
-blocks from the block after it. A delivery that is still running after the limit is logged with
-`logger.error`, and its block is requested again (delivery stays at-least-once; consumers must
-tolerate a repeated block). A delivery that finishes after the new connection has requested blocks
+blocks from the block after it. A delivery that is still running after the limit is reported: with an
+`onError` handler the receiver calls it and requests nothing (the consumer owns recovery, for example a
+process exit and a resume from its persisted cursor); without one it logs `logger.error` and requests
+that block again, so it never latches (delivery stays at-least-once). A drain is not counted as
+silence by the watchdog, and `stop()` supersedes a drain. A delivery that finishes after the new connection has requested blocks
 never moves `current_block`, and `current_block` only moves forward.
 
 ## Tuning environment variables
