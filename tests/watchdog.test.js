@@ -368,6 +368,36 @@ describe('statereceiver liveness watchdog (silent stream + missing pong)', () =>
     expect(server.connectionsSeen.length).toBe(2);
   });
 
+  it('(i) 4.0.6 a handler error halts delivery: no later block is delivered before the consumer exits (WaxPoller onError shape)', async () => {
+    const delivered = [];
+    server = await startServer((ws, index) => {
+      if (index === 0) {
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) sendBlocks(ws, 4);
+        }, 30);
+      }
+    });
+    // Mirrors @waxio/wax-poller 1.2.1: log, sr.stop() synchronously, then an awaited Slack post,
+    // then process.exit(1). The cursor is persisted BEFORE handlers run, so a restart resumes AT the
+    // failed block -- unless a later block is delivered (and persisted) before the exit.
+    const onError = jest.fn(async () => {
+      receiver.stop();
+      await sleep(300); // the Slack post
+    });
+    makeReceiver({ silenceTimeoutMs: 60000, pingIntervalMs: 60000, onError });
+    receiver.registerTraceHandler({
+      processTrace: async (blockNum) => {
+        delivered.push(blockNum);
+        if (blockNum === START_BLOCK + 1) throw new Error('handler failed (e.g. RPC push error)');
+      },
+    });
+    receiver.start();
+    await waitFor(() => onError.mock.calls.length >= 1, 3000, 'onError');
+    await sleep(400);
+    expect(delivered).toEqual([START_BLOCK, START_BLOCK + 1]); // nothing after the failed block
+    expect(receiver.current_block).toBe(START_BLOCK); // the failed block did not advance the cursor
+  });
+
   it('(a-control) a stream that keeps delivering is never torn down', async () => {
     server = await startServer((ws) => {
       const t = setInterval(() => {
