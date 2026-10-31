@@ -161,7 +161,9 @@ describe('statereceiver liveness watchdog (silent stream + missing pong)', () =>
 
   it('(a2) the watchdog stays armed after it fires: repeated silent connections each get abandoned', async () => {
     server = await startServer((ws) => {
-      setTimeout(() => sendBlocks(ws, 1), 30);
+      setTimeout(() => {
+        if (ws.readyState === WebSocket.OPEN) sendBlocks(ws, 1);
+      }, 30);
     });
     makeReceiver({ silenceTimeoutMs: 300, pingIntervalMs: 60000 });
     receiver.start();
