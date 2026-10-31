@@ -28,6 +28,8 @@ declare class StateReceiver {
      * @param {number} config.maxQueueSize - max buffer message size, default 100
      * @param {boolean} config.fetchBlockTime - fetch block time, default true
      * @param {string[]} config.deserializerActions - list of actions to be deserialized. Ex: ['eosio.token::transfer', 'bridge.wax::reqnft']
+     * @param {number} [config.silenceTimeoutMs] - reconnect when no message has arrived for this long while the receiver is idle, default 90000. 0 disables.
+     * @param {number} [config.pingIntervalMs] - send a websocket ping this often; no pong before the next ping means the socket is dead, default 20000. 0 disables.
      */
     constructor(config: {
         startBlock: number;
@@ -40,6 +42,8 @@ declare class StateReceiver {
         maxQueueSize: number;
         fetchBlockTime: boolean;
         deserializerActions: string[];
+        silenceTimeoutMs?: number;
+        pingIntervalMs?: number;
     });
     /**
      * @type {Connection}
@@ -78,6 +82,8 @@ declare class StateReceiver {
         maxQueueSize: number;
         fetchBlockTime: boolean;
         deserializerActions: string[];
+        silenceTimeoutMs?: number;
+        pingIntervalMs?: number;
     }>;
     startBlock: number;
     endBlock: string | number;
@@ -90,6 +96,12 @@ declare class StateReceiver {
      * connection can never deliver blocks, ACK, or clear the in-progress flag of a live one.
      */
     _connectionEpoch: number;
+    silenceTimeoutMs: number;
+    pingIntervalMs: number;
+    _silenceTimer: NodeJS.Timer;
+    _pingTimer: NodeJS.Timer;
+    _lastActivityAt: number;
+    _awaitingPong: boolean;
     processCount: number;
     debuging: boolean;
     /** One get_blocks_ack per processed message (num_messages:1). Fixes throughput with some state-history nodes. */
@@ -108,6 +120,30 @@ declare class StateReceiver {
      */
     abi: any;
     start(): void;
+    /**
+     * THE FIX FOR THE 2026-10-29 BRIDGE STALL (48 h).
+     *
+     * The SHIP stream stopped delivering on an OPEN socket: no close frame, no socket error. The
+     * only reconnect triggers were `close` and `error`, so the receiver waited forever while the
+     * process looked healthy. Two independent checks make a dead-but-open socket detectable:
+     *
+     *  - silence: no message for `silenceTimeoutMs` while the receiver is idle (queue empty, no
+     *    batch in flight). Time spent processing is NOT silence: with the ACK window exhausted the
+     *    server is correctly waiting for us, and tearing that down would churn a slow consumer.
+     *  - ping: a websocket ping every `pingIntervalMs`; no pong before the next ping is a dead peer.
+     *
+     * Either one goes through the SAME path as the 4.0.4 handshake timeout — Connection._failAttempt
+     * — which retires the socket's generation, tears it down and calls onClose → start(). start()
+     * re-requests blocks from current_block + 1 (see requestBlocks), so nothing is skipped.
+     *
+     * Timers are bound to ONE Connection. start() and stop() clear them, and every callback returns
+     * early if its Connection is no longer current, so a replaced socket can never fire a reconnect.
+     */
+    _armWatchdog(connection: any): void;
+    _clearWatchdog(): void;
+    _checkSilence(connection: any): void;
+    _checkPing(connection: any): void;
+    _watchdogFire(connection: any, reason: any): void;
     restart(startBlock: any, endBlock: any): void;
     stop(): void;
     /**

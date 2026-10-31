@@ -5,6 +5,16 @@ const serialize = require('./serialize');
 const deserializeDeep = require('./deserialize-deep');
 
 /**
+ * Default silence budget. On WAX an irreversible SHIP stream delivers a block about every 0.5 s,
+ * so 90 s of nothing on an open socket is ~180 missed blocks: never a slow stream, always a dead
+ * one. Chosen well above the 30 s handshake budget so the two timeouts never race.
+ */
+const DEFAULT_SILENCE_TIMEOUT_MS = 90000;
+
+/** Default websocket ping cadence. A ping with no pong by the next tick marks the socket dead. */
+const DEFAULT_PING_INTERVAL_MS = 20000;
+
+/**
  * @typedef {import('eosjs').Api} EosApi
  */
 
@@ -66,6 +76,8 @@ class StateReceiver {
    * @param {number} config.maxQueueSize - max buffer message size, default 100
    * @param {boolean} config.fetchBlockTime - fetch block time, default true
    * @param {string[]} config.deserializerActions - list of actions to be deserialized. Ex: ['eosio.token::transfer', 'bridge.wax::reqnft']
+   * @param {number} [config.silenceTimeoutMs] - reconnect when no message has arrived for this long while the receiver is idle, default 90000. 0 disables.
+   * @param {number} [config.pingIntervalMs] - send a websocket ping this often; no pong before the next ping means the socket is dead, default 20000. 0 disables.
    */
   constructor(config) {
     this.logger = config.logger || console;
@@ -91,6 +103,14 @@ class StateReceiver {
      */
     this._connectionEpoch = 0;
     this.fetchBlockTime = config.fetchBlockTime === undefined ? true : config.fetchBlockTime;
+
+    this.silenceTimeoutMs = Number(config.silenceTimeoutMs ?? DEFAULT_SILENCE_TIMEOUT_MS);
+    this.pingIntervalMs = Number(config.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS);
+    this._silenceTimer = null;
+    this._pingTimer = null;
+    this._lastActivityAt = 0;
+    this._awaitingPong = false;
+
     this.init();
 
     if (!config.eosApi) {
@@ -162,6 +182,7 @@ class StateReceiver {
       this.processingMessageData = false;
     }
     this.init();
+    this._clearWatchdog();
 
     if (this.connection) {
       // close previous connection
@@ -169,20 +190,140 @@ class StateReceiver {
       this.connection = null;
     }
 
-    this.connection = new Connection({
+    const connection = new Connection({
       logger: this.logger,
       socketAddresses: Array.from(new Set(this.config.socketAddresses)),
       onError: (err) => this._onError(err),
       onMessage: this.onMessage.bind(this),
       onClose: () => {
+        // A late close from a connection that stop() or a later start() already replaced must not
+        // restart the receiver: that is how a stopped receiver came back to life.
+        if (this.connection !== connection) return;
         if (this.debuging) {
           this.logger.info(`Connection is closed. Restart!`);
         }
         this.start();
       },
     });
+    this.connection = connection;
 
     this.connection.connect();
+    this._armWatchdog(connection);
+  }
+
+  /**
+   * THE FIX FOR THE 2026-10-29 BRIDGE STALL (48 h).
+   *
+   * The SHIP stream stopped delivering on an OPEN socket: no close frame, no socket error. The
+   * only reconnect triggers were `close` and `error`, so the receiver waited forever while the
+   * process looked healthy. Two independent checks make a dead-but-open socket detectable:
+   *
+   *  - silence: no message for `silenceTimeoutMs` while the receiver is idle (queue empty, no
+   *    batch in flight). Time spent processing is NOT silence: with the ACK window exhausted the
+   *    server is correctly waiting for us, and tearing that down would churn a slow consumer.
+   *  - ping: a websocket ping every `pingIntervalMs`; no pong before the next ping is a dead peer.
+   *
+   * Either one goes through the SAME path as the 4.0.4 handshake timeout — Connection._failAttempt
+   * — which retires the socket's generation, tears it down and calls onClose → start(). start()
+   * re-requests blocks from current_block + 1 (see requestBlocks), so nothing is skipped.
+   *
+   * Timers are bound to ONE Connection. start() and stop() clear them, and every callback returns
+   * early if its Connection is no longer current, so a replaced socket can never fire a reconnect.
+   */
+  _armWatchdog(connection) {
+    this._lastActivityAt = Date.now();
+    this._awaitingPong = false;
+
+    if (Number.isFinite(this.silenceTimeoutMs) && this.silenceTimeoutMs > 0) {
+      const tickMs = Math.max(10, Math.min(1000, Math.floor(this.silenceTimeoutMs / 4)));
+      this._silenceTimer = setInterval(() => this._checkSilence(connection), tickMs);
+      unrefTimer(this._silenceTimer);
+    }
+
+    if (Number.isFinite(this.pingIntervalMs) && this.pingIntervalMs > 0) {
+      const ws = connection.ws;
+      if (ws && typeof ws.on === 'function') {
+        ws.on('pong', () => {
+          if (this.connection !== connection || connection.ws !== ws) return;
+          this._awaitingPong = false;
+        });
+      }
+      this._pingTimer = setInterval(() => this._checkPing(connection), this.pingIntervalMs);
+      unrefTimer(this._pingTimer);
+    }
+  }
+
+  _clearWatchdog() {
+    if (this._silenceTimer) {
+      clearInterval(this._silenceTimer);
+      this._silenceTimer = null;
+    }
+    if (this._pingTimer) {
+      clearInterval(this._pingTimer);
+      this._pingTimer = null;
+    }
+    this._awaitingPong = false;
+  }
+
+  _checkSilence(connection) {
+    if (this.connection !== connection) return;
+    const now = Date.now();
+    if (this.processingMessageData || this.serializedMessageQueue.length > 0) {
+      // We are the bottleneck, not the server.
+      this._lastActivityAt = now;
+      return;
+    }
+    // Before `open`, the 30 s handshake timeout in Connection owns the socket.
+    if (!connection.connected) return;
+    const silentMs = now - this._lastActivityAt;
+    if (silentMs >= this.silenceTimeoutMs) {
+      this._watchdogFire(connection, `no message within ${this.silenceTimeoutMs} ms`);
+    }
+  }
+
+  _checkPing(connection) {
+    if (this.connection !== connection) return;
+    const ws = connection.ws;
+    if (!connection.connected || !ws || ws.readyState !== 1 /* OPEN */) return;
+    if (this._awaitingPong) {
+      this._watchdogFire(connection, `no pong within ${this.pingIntervalMs} ms`);
+      return;
+    }
+    try {
+      this._awaitingPong = true;
+      ws.ping();
+    } catch (e) {
+      this._onError(e);
+    }
+  }
+
+  _watchdogFire(connection, reason) {
+    if (this.connection !== connection) return;
+    this._clearWatchdog();
+
+    const silentMs = Date.now() - this._lastActivityAt;
+    const resumeFrom = this.current_block > 0 ? this.current_block + 1 : this.startBlock;
+    // logger.error, not warn: consumers pass their own logger and only info/error are guaranteed.
+    const message =
+      `[statereceiver] watchdog fired: ${reason}; no message for ${silentMs} ms, ` +
+      `last block ${this.current_block}. Terminating the socket and reconnecting from block ${resumeFrom}.`;
+
+    // terminate(), not close(): a close handshake with a dead peer would wait for a reply that is
+    // never coming. The generation bump inside _failAttempt makes its late `close` event stale.
+    const ws = connection.ws;
+    try {
+      if (ws) ws.terminate();
+    } catch (_e) {
+      // safe to ignore: the socket is being abandoned either way
+    }
+
+    if (typeof connection._failAttempt === 'function') {
+      // Logs `message` once, releases the guard and calls onClose → start().
+      connection._failAttempt(connection._generation, message);
+    } else {
+      this.logger.error(message);
+      this.start();
+    }
   }
 
   restart(startBlock, endBlock) {
@@ -196,6 +337,7 @@ class StateReceiver {
 
   stop() {
     this.logger.info(`==== Receive stop command: stopping receiver.`);
+    this._clearWatchdog();
     if (this.connection) {
       this.connection.disconnect();
       this.connection = null;
@@ -219,6 +361,7 @@ class StateReceiver {
   }
 
   onMessage(data) {
+    this._lastActivityAt = Date.now();
     try {
       if (!this.abi) {
         this.receivedAbi(data);
@@ -530,6 +673,12 @@ class StateReceiver {
       this.logger.error(e);
     }
   }
+}
+
+function unrefTimer(t) {
+  // Never hold the event loop open for a watchdog. Guarded: a fake-timer setInterval may not
+  // return a Node Timeout.
+  if (t && typeof t.unref === 'function') t.unref();
 }
 
 module.exports = StateReceiver;
