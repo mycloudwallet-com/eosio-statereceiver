@@ -98,6 +98,10 @@ declare class StateReceiver {
     _connectionEpoch: number;
     silenceTimeoutMs: number;
     pingIntervalMs: number;
+    drainTimeoutMs: number;
+    _inflightDelivery: Promise<void>;
+    _draining: boolean;
+    _requestedEpoch: number;
     _silenceTimer: NodeJS.Timer;
     _pingTimer: NodeJS.Timer;
     _lastActivityAt: number;
@@ -153,7 +157,7 @@ declare class StateReceiver {
     registerTraceHandler(h: TraceHandler): void;
     onMessage(data: any): void;
     receivedAbi(data: any): void;
-    requestBlocks(): void;
+    requestBlocks(): Promise<void>;
     requestStatus(): void;
     _logBackpressure(level: any, msg: any): void;
     sendAck(): void;
@@ -177,6 +181,7 @@ declare class StateReceiver {
         serializedMessageQueueSize: number;
     };
     deliverDeserializedBlock(blockData: any): Promise<void>;
+    _warn(...args: any[]): void;
     _onError(e: any): void;
 }
 declare namespace StateReceiver {

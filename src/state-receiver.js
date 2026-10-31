@@ -15,6 +15,17 @@ const DEFAULT_SILENCE_TIMEOUT_MS = 90000;
 const DEFAULT_PING_INTERVAL_MS = 20000;
 
 /**
+ * 4.0.6 — a reconnect must not overlap a block delivery that is still running. Since 4.0.4, start()
+ * supersedes an in-flight batch instead of waiting for it (that fixed a permanent latch), but the
+ * block whose trace handlers are ALREADY running keeps running. Without a drain, the new socket asks
+ * for current_block + 1 while current_block still points at the block before it, so that block is
+ * delivered a second time WHILE the first delivery is still in progress: two runs of the consumer's
+ * handlers for one block, overlapping in one process. requestBlocks() therefore waits for the
+ * in-flight delivery (bounded, so a delivery that never settles cannot latch the receiver again).
+ */
+const DEFAULT_DRAIN_TIMEOUT_MS = 60000;
+
+/**
  * @typedef {import('eosjs').Api} EosApi
  */
 
@@ -106,6 +117,15 @@ class StateReceiver {
 
     this.silenceTimeoutMs = Number(config.silenceTimeoutMs ?? DEFAULT_SILENCE_TIMEOUT_MS);
     this.pingIntervalMs = Number(config.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS);
+    // 4.0.6: how long a reconnect waits for a block delivery that is still running before it asks
+    // the new socket for blocks. 0 = do not wait (4.0.5 behaviour).
+    this.drainTimeoutMs = Number(config.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
+    this._inflightDelivery = null;
+    this._draining = false;
+    // The epoch whose connection last sent get_blocks_request. A delivery that a reconnect superseded
+    // may still advance the cursor until the new connection has requested blocks (that is exactly
+    // what the drain waits for), and must not touch it after.
+    this._requestedEpoch = -1;
     this._silenceTimer = null;
     this._pingTimer = null;
     this._lastActivityAt = 0;
@@ -175,7 +195,7 @@ class StateReceiver {
      */
     this._connectionEpoch += 1;
     if (this.processingMessageData) {
-      this.logger.warn(
+      this._warn(
         `Restarting while a message batch was in flight (epoch ${this._connectionEpoch}); ` +
           `abandoning it. Its connection is gone and its results are no longer valid.`
       );
@@ -268,8 +288,10 @@ class StateReceiver {
   _checkSilence(connection) {
     if (this.connection !== connection) return;
     const now = Date.now();
-    if (this.processingMessageData || this.serializedMessageQueue.length > 0) {
-      // We are the bottleneck, not the server.
+    if (this.processingMessageData || this.serializedMessageQueue.length > 0 || this._draining) {
+      // We are the bottleneck, not the server. A drain (4.0.6) is bounded by drainTimeoutMs on its
+      // own, so it must not also be killed as silence -- that would reconnect forever without ever
+      // requesting blocks when silenceTimeoutMs < drainTimeoutMs.
       this._lastActivityAt = now;
       return;
     }
@@ -337,6 +359,9 @@ class StateReceiver {
 
   stop() {
     this.logger.info(`==== Receive stop command: stopping receiver.`);
+    // 4.0.6: a stop supersedes any in-flight batch or drain, exactly like a reconnect.
+    this._connectionEpoch += 1;
+    this._draining = false;
     this._clearWatchdog();
     if (this.connection) {
       this.connection.disconnect();
@@ -395,10 +420,55 @@ class StateReceiver {
     this.types = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), this.abi);
 
     // ready to request blocks
-    this.requestBlocks();
+    // Promise.resolve: a subclass or test may still override requestBlocks synchronously.
+    Promise.resolve(this.requestBlocks()).catch((e) => this._onError(e));
   }
 
-  requestBlocks() {
+  async requestBlocks() {
+    const epoch = this._connectionEpoch;
+    const inflight = this._inflightDelivery;
+    if (inflight && this.drainTimeoutMs > 0) {
+      const started = Date.now();
+      this._draining = true;
+      let timer;
+      const timedOut = await Promise.race([
+        inflight.then(
+          () => false,
+          () => false
+        ),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(true), this.drainTimeoutMs);
+          if (timer && typeof timer.unref === 'function') timer.unref();
+        }),
+      ]);
+      clearTimeout(timer);
+      if (this._connectionEpoch === epoch) this._draining = false;
+      if (timedOut && this._connectionEpoch === epoch) {
+        const message =
+          `[statereceiver] block delivery still running after ${this.drainTimeoutMs} ms ` +
+          `(cursor ${this.current_block}).`;
+        if (typeof this.config.onError === 'function') {
+          // The consumer owns recovery. Requesting now would deliver blocks while the stuck handler
+          // still runs (overlap); the bridge consumers exit the process here and resume from their
+          // persisted cursor, which also ends the stuck handler.
+          this._onError(new Error(`${message} Not requesting blocks; reporting to onError.`));
+          return;
+        }
+        // No onError: never latch. Request again from the block after the cursor (that block may be
+        // delivered again while the stuck delivery is still running).
+        this.logger.error(`${message} Requesting blocks anyway from ${this.current_block + 1}.`);
+      } else if (!timedOut) {
+        this.logger.info(
+          `[statereceiver] waited ${
+            Date.now() - started
+          } ms for the in-flight block delivery before requesting blocks.`
+        );
+      }
+      // Another reconnect happened while we waited: that connection requests its own blocks.
+      if (this._connectionEpoch !== epoch) return;
+    }
+
+    this._requestedEpoch = this._connectionEpoch;
     let startBlock = parseInt(this.startBlock);
     if (this.current_block > 0) {
       startBlock = this.current_block + 1;
@@ -473,7 +543,7 @@ class StateReceiver {
     if (this.connection && this.connection.ws && this.connection.connected == true) {
       this.connection.ws.send(serialize(this.types, 'request', request));
     } else {
-      this.logger.warn('Connection is not ready, cannot send message.');
+      this._warn('Connection is not ready, cannot send message.');
     }
   }
 
@@ -557,7 +627,7 @@ class StateReceiver {
           );
         }
         if (superseded()) {
-          this.logger.warn(
+          this._warn(
             `Abandoning message batch: superseded by a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}).`
           );
           return;
@@ -580,14 +650,27 @@ class StateReceiver {
         });
 
         if (superseded()) {
-          this.logger.warn(
+          this._warn(
             `Abandoning message batch: superseded by a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}).`
           );
           return;
         }
 
         if (blockData[1] && blockData[1].this_block) {
-          await this.deliverDeserializedBlock(blockData[1]);
+          const delivery = this.deliverDeserializedBlock(blockData[1]);
+          this._inflightDelivery = delivery;
+          try {
+            await delivery;
+          } finally {
+            if (this._inflightDelivery === delivery) this._inflightDelivery = null;
+          }
+          if (superseded()) {
+            this._warn(
+              `Delivery finished after a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}); ` +
+                `not acknowledging it on the new connection.`
+            );
+            return;
+          }
           this._maybeEmitSyncStats(blockData[1]);
         } else {
           this.logger.info(`Reached the head of the chain: ${JSON.stringify(blockData)}`);
@@ -639,8 +722,9 @@ class StateReceiver {
   }
 
   async deliverDeserializedBlock(blockData) {
+    const myEpoch = this._connectionEpoch;
     if (!blockData || !blockData.this_block) {
-      this.logger.warn(`Block data is not valid.`, blockData);
+      this._warn(`Block data is not valid.`, blockData);
       return;
     }
 
@@ -663,7 +747,23 @@ class StateReceiver {
       );
     }
 
-    this.current_block = block_num;
+    // A delivery that a reconnect superseded may still advance the cursor while the new connection
+    // is draining (it has not requested blocks yet) -- that is how the drain avoids re-delivering
+    // this block. Once the new connection HAS requested blocks it owns the cursor, and a late write
+    // could move it backward and make the next reconnect replay blocks.
+    if (this._connectionEpoch !== myEpoch && this._requestedEpoch === this._connectionEpoch) {
+      this._warn(
+        `Block ${block_num} finished after a reconnect (epoch ${myEpoch} -> ${this._connectionEpoch}); cursor left at ${this.current_block}.`
+      );
+      return;
+    }
+    this.current_block = Math.max(this.current_block, block_num);
+  }
+
+  // 4.0.6: consumers only guarantee info/error; never throw for a missing warn.
+  _warn(...args) {
+    if (typeof this.logger.warn === 'function') this.logger.warn(...args);
+    else this.logger.info(...args);
   }
 
   _onError(e) {

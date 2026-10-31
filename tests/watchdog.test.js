@@ -181,6 +181,193 @@ describe('statereceiver liveness watchdog (silent stream + missing pong)', () =>
     expect(fired.length).toBeGreaterThanOrEqual(2);
   });
 
+  it('(c) 4.0.6 a reconnect waits for the running delivery: no overlap, no re-delivery, cursor advanced', async () => {
+    let active = 0;
+    let maxActive = 0;
+    let handlerDoneAt = 0;
+    server = await startServer((ws, index, record) => {
+      ws.on('message', () => {
+        if (!record.firstMsgAt) record.firstMsgAt = Date.now();
+      });
+      if (index === 0) {
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) sendBlocks(ws, 1);
+        }, 30);
+        // drop the socket while the block's handler is still running
+        setTimeout(() => ws.terminate(), 200);
+      }
+    });
+    makeReceiver({ silenceTimeoutMs: 60000, pingIntervalMs: 60000, drainTimeoutMs: 5000 });
+    receiver.registerTraceHandler({
+      processTrace: async () => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await sleep(600);
+        active--;
+        handlerDoneAt = Date.now();
+      },
+    });
+    receiver.start();
+
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    await waitFor(
+      () => getBlocksRequests(server.connectionsSeen[1]).length >= 1,
+      3000,
+      'get_blocks_request on the new connection'
+    );
+    const [, args] = getBlocksRequests(server.connectionsSeen[1])[0];
+    expect(handlerDoneAt).toBeGreaterThan(0);
+    expect(server.connectionsSeen[1].firstMsgAt).toBeGreaterThanOrEqual(handlerDoneAt);
+    expect(args.start_block_num).toBe(START_BLOCK + 1); // not re-delivered
+    expect(receiver.current_block).toBe(START_BLOCK);
+    expect(maxActive).toBe(1);
+  });
+
+  it('(d) 4.0.6 a delivery that never settles cannot latch the reconnect, and cannot move the cursor later', async () => {
+    let release;
+    const hung = new Promise((r) => {
+      release = r;
+    });
+    server = await startServer((ws, index) => {
+      if (index === 0) {
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) sendBlocks(ws, 1);
+        }, 30);
+        setTimeout(() => ws.terminate(), 150);
+      }
+    });
+    makeReceiver({ silenceTimeoutMs: 60000, pingIntervalMs: 60000, drainTimeoutMs: 300 });
+    receiver.registerTraceHandler({ processTrace: () => hung });
+    receiver.start();
+
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    await waitFor(
+      () => getBlocksRequests(server.connectionsSeen[1]).length >= 1,
+      3000,
+      'get_blocks_request after the drain timeout'
+    );
+    const [, args] = getBlocksRequests(server.connectionsSeen[1])[0];
+    expect(args.start_block_num).toBe(START_BLOCK); // the unfinished block is requested again
+    const lines = receiver.logger.error.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes('still running after 300 ms'))).toBe(true);
+
+    const before = receiver.current_block;
+    release();
+    await sleep(50);
+    expect(receiver.current_block).toBe(before); // the late finish does not move the cursor
+  });
+
+  function hungDeliveryServer() {
+    return startServer((ws, index) => {
+      if (index === 0) {
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) sendBlocks(ws, 1);
+        }, 30);
+        setTimeout(() => ws.terminate(), 150);
+      }
+    });
+  }
+
+  it('(e) 4.0.6 drain timeout with onError: reported, and no blocks are requested (no overlap)', async () => {
+    const errors = [];
+    server = await hungDeliveryServer();
+    makeReceiver({
+      silenceTimeoutMs: 60000,
+      pingIntervalMs: 60000,
+      drainTimeoutMs: 300,
+      onError: (e) => errors.push(String(e && e.message)),
+    });
+    receiver.registerTraceHandler({ processTrace: () => new Promise(() => {}) });
+    receiver.start();
+    await waitFor(
+      () => errors.some((m) => m.includes('still running after 300 ms')),
+      3000,
+      'onError'
+    );
+    await sleep(200);
+    expect(server.connectionsSeen.length).toBe(2);
+    expect(getBlocksRequests(server.connectionsSeen[1])).toHaveLength(0);
+  });
+
+  it('(f) 4.0.6 a drain is not silence: silence < drain does not loop, blocks are requested after it', async () => {
+    let release;
+    server = await hungDeliveryServer();
+    makeReceiver({ silenceTimeoutMs: 200, pingIntervalMs: 60000, drainTimeoutMs: 5000 });
+    receiver.registerTraceHandler({
+      processTrace: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    await sleep(700); // > 3 x silenceTimeoutMs while draining
+    expect(server.connectionsSeen.length).toBe(2);
+    release();
+    await waitFor(
+      () => getBlocksRequests(server.connectionsSeen[1]).length >= 1,
+      2000,
+      'get_blocks_request after the drain'
+    );
+    expect(getBlocksRequests(server.connectionsSeen[1])[0][1].start_block_num).toBe(
+      START_BLOCK + 1
+    );
+  });
+
+  it('(g) 4.0.6 a logger without warn never breaks a reconnect mid-block', async () => {
+    let release;
+    server = await hungDeliveryServer();
+    const port = server.address().port;
+    const logger = { info: jest.fn(), debug: jest.fn(), error: jest.fn() }; // no warn
+    receiver = new StateReceiver({
+      logger,
+      startBlock: START_BLOCK,
+      socketAddresses: [`ws://127.0.0.1:${port}`],
+      eosApi: {},
+      maxQueueSize: 10,
+      fetchBlockTime: false,
+      silenceTimeoutMs: 60000,
+      pingIntervalMs: 60000,
+      drainTimeoutMs: 5000,
+    });
+    receiver.registerTraceHandler({
+      processTrace: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    release();
+    await waitFor(
+      () => getBlocksRequests(server.connectionsSeen[1]).length >= 1,
+      2000,
+      'get_blocks_request after the drain'
+    );
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join('\n')).not.toMatch(
+      /warn is not a function/
+    );
+  });
+
+  it('(h) 4.0.6 stop() during a drain: nothing is requested and nothing reconnects', async () => {
+    let release;
+    server = await hungDeliveryServer();
+    makeReceiver({ silenceTimeoutMs: 60000, pingIntervalMs: 60000, drainTimeoutMs: 5000 });
+    receiver.registerTraceHandler({
+      processTrace: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 3000, 'a second connection');
+    receiver.stop();
+    release();
+    await sleep(300);
+    expect(getBlocksRequests(server.connectionsSeen[1])).toHaveLength(0);
+    expect(server.connectionsSeen.length).toBe(2);
+  });
+
   it('(a-control) a stream that keeps delivering is never torn down', async () => {
     server = await startServer((ws) => {
       const t = setInterval(() => {
