@@ -66,6 +66,20 @@ Received 946.5 B/s; Queue size: 39
 ...
 ```
 
+## Liveness watchdog (4.0.5)
+
+A SHIP stream can stop delivering blocks on an open socket, with no close frame and no error. Two
+constructor options detect this. Both reconnect through the normal reconnect path and resume from
+the current block. Set either one to `0` to disable it.
+
+| Option             | Default | Purpose                                                                                                                       |
+| ------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `silenceTimeoutMs` | `90000` | Reconnect when no message has arrived for this long while the receiver is idle. Time spent processing a batch is not silence. |
+| `pingIntervalMs`   | `20000` | Send a websocket ping this often. When no pong arrives before the next ping, the socket is dead and the receiver reconnects.  |
+
+When the watchdog fires, it logs one line with `logger.error` that names the cause, the silence
+duration and the last block.
+
 ## Tuning environment variables
 
 These are all optional. Defaults preserve historical behavior.
