@@ -159,6 +159,26 @@ describe('statereceiver liveness watchdog (silent stream + missing pong)', () =>
     expect(fired[0]).toContain(`last block ${START_BLOCK + 2}`);
   });
 
+  it('(a2) the watchdog stays armed after it fires: repeated silent connections each get abandoned', async () => {
+    server = await startServer((ws) => {
+      setTimeout(() => sendBlocks(ws, 1), 30);
+    });
+    makeReceiver({ silenceTimeoutMs: 300, pingIntervalMs: 60000 });
+    receiver.start();
+    await waitFor(() => server.connectionsSeen.length >= 2, 4000, 'second connection');
+    await sleep(20);
+    expect(receiver._silenceTimer).not.toBeNull(); // re-armed for the new socket
+    await waitFor(
+      () => server.connectionsSeen.length >= 3,
+      4000,
+      'a third connection (second watchdog fire)'
+    );
+    const fired = receiver.logger.error.mock.calls
+      .map((c) => String(c[0]))
+      .filter((l) => l.includes('watchdog'));
+    expect(fired.length).toBeGreaterThanOrEqual(2);
+  });
+
   it('(a-control) a stream that keeps delivering is never torn down', async () => {
     server = await startServer((ws) => {
       const t = setInterval(() => {
